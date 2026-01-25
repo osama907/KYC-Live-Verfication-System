@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Identity Verification</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<style>
+    body { background:#121212; color:#fff; font-family:'Segoe UI', sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+    .app-box { width:95%; max-width:600px; text-align:center; }
+    
+    .video-container { position:relative; border-radius:20px; overflow:hidden; border:4px solid #333; background: #000; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    video { width:100%; height: auto; transform:scaleX(-1); display: block; }
+    
+    #status-overlay { position:absolute; top:20px; left:0; right:0; text-align:center; font-size:1.5rem; font-weight: bold; z-index: 10; text-shadow: 0 2px 4px #000; }
+    #guide-box { position:absolute; top:50%; left:50%; width:220px; height:280px; transform:translate(-50%,-50%); border:4px dashed rgba(255,255,255,0.5); border-radius:50%; }
+    #spoof-alert { display:none; position:absolute; inset:0; background:rgba(220, 20, 20, 0.95); align-items:center; justify-content:center; flex-direction:column; z-index: 20; }
+    
+    .btn-upload { background:#007bff; color:#fff; border:none; padding:15px 30px; font-size:1.1rem; border-radius:50px; cursor:pointer; margin-bottom:15px; font-weight: bold; transition: 0.2s; }
+    .btn-retry { background: white; color: #cc0000; border: none; padding: 10px 25px; font-size: 1rem; font-weight: bold; border-radius: 20px; margin-top: 10px; cursor: pointer; }
+    .btn-retry:hover { background: #eee; }
+
+    #result-area { margin-top:15px; background:#222; padding:15px; border-radius:10px; display:none; border: 1px solid #444; }
+</style>
+</head>
+
+<body>
+
+<div class="app-box">
+    <button class="btn-upload" id="uploadBtn" onclick="document.getElementById('cnicInput').click()">📁 Upload CNIC</button>
+    <input type="file" id="cnicInput" accept="image/*" hidden>
+
+    <div class="video-container">
+        <video id="video" playsinline muted></video>
+        <div id="guide-box"></div>
+        <div id="status-overlay">Waiting for Upload...</div>
+        
+        <div id="spoof-alert">
+            <h2 style="margin:0; font-size: 2rem;">⚠️ TIMEOUT</h2>
+            <p>Live Face Check Failed</p>
+            <button class="btn-retry" onclick="resetLiveness()">Try Again</button>
+        </div>
+    </div>
+
+    <div id="result-area"></div>
+    <canvas id="canvas" hidden></canvas>
+</div>
+
+<script>
+    const API_URL = "http://127.0.0.1:8000";
+    const TASKS = [
+        {type:'blink', msg:"😉 Blink Eyes"},
+        {type:'left',  msg:"⬅️ Turn Left"},
+        {type:'right', msg:"➡️ Turn Right"},
+        {type:'center',msg:"😐 Look Center"}
+    ];
+
+    let taskIndex = 0, isProcessing = false, blinkCounter = 0, lastAction = 0; 
+    const SPOOF_TIMEOUT = 10000; 
+
+    const video = document.getElementById("video");
+    const status = document.getElementById("status-overlay");
+    const guide = document.getElementById("guide-box");
+    const spoof = document.getElementById("spoof-alert");
+    const result = document.getElementById("result-area");
+    const cnicInput = document.getElementById("cnicInput");
+    const uploadBtn = document.getElementById("uploadBtn");
+
+    const faceMesh = new FaceMesh({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+    faceMesh.setOptions({maxNumFaces: 1, refineLandmarks: true});
+    faceMesh.onResults(onResults);
+
+    const camera = new Camera(video, {
+        onFrame: async () => { if(!isProcessing) await faceMesh.send({image: video}); },
+        width: 640, height: 480
+    });
+
+    function onResults(r) {
+        if (isProcessing) return; // Keeps camera paused if showing result
+        if (!r.multiFaceLandmarks || r.multiFaceLandmarks.length === 0) {
+            status.innerText = "❌ No Face Detected"; guide.style.borderColor = "red"; return;
+        }
+        
+        guide.style.borderColor = "#00ff00"; 
+        if (Date.now() - lastAction > SPOOF_TIMEOUT) { spoof.style.display = "flex"; return; }
+
+        const lm = r.multiFaceLandmarks[0];
+        const task = TASKS[taskIndex];
+        status.innerText = task.msg;
+
+        if (checkTask(task.type, lm)) {
+            lastAction = Date.now(); 
+            if (taskIndex < TASKS.length - 1) { taskIndex++; blinkCounter = 0; } 
+            else { captureAndSend(); }
+        }
+    }
+
+    function checkTask(t, lm) {
+        const nose = lm[1], eyeTop = lm[159], eyeBottom = lm[145];
+        if (t === 'blink') {
+            const d = Math.hypot(eyeTop.x - eyeBottom.x, eyeTop.y - eyeBottom.y);
+            if (d < 0.012) blinkCounter++;
+            return blinkCounter > 2;
+        }
+        if (t === 'left')  return nose.x < 0.35;
+        if (t === 'right') return nose.x > 0.65;
+        if (t === 'center') return nose.x > 0.4 && nose.x < 0.6;
+        return false;
+    }
+
+    function resetLiveness() {
+        taskIndex = 0; blinkCounter = 0; lastAction = Date.now(); 
+        spoof.style.display = "none"; status.innerText = TASKS[0].msg;
+    }
+
+    // --- RESTART BUTTON FUNCTION ---
+    function retryProcess() {
+        isProcessing = false; // Unpause camera
+        resetLiveness();
+        result.style.display = "none";
+        status.innerText = TASKS[0].msg;
+        guide.style.borderColor = "white";
+    }
+
+    cnicInput.onchange = () => {
+        if (cnicInput.files.length > 0) {
+            uploadBtn.innerText = "✅ CNIC Uploaded";
+            uploadBtn.disabled = true;
+            lastAction = Date.now();
+            camera.start();
+        }
+    };
+
+    function captureAndSend() {
+        isProcessing = true; // Pause camera loop
+        status.innerText = "📸 Verifying Identity...";
+        
+        const canvas = document.getElementById("canvas");
+        canvas.width = video.videoWidth; 
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext("2d");
+        
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0);
+
+        canvas.toBlob(async blob => {
+            const fd = new FormData();
+            fd.append("cnic_image", cnicInput.files[0]);
+            fd.append("live_image", blob, "live.jpg");
+
+            try {
+                const res = await fetch(`${API_URL}/verify`, { method: "POST", body: fd });
+                if (!res.ok) throw new Error(`Server Error: ${res.status}`);
+
+                const data = await res.json();
+                result.style.display = "block"; 
+
+                // --- 🔴 INVALID ID (No Face / Vertical) ---
+                if (data.status === "error") {
+                    result.style.border = "2px solid #f44336"; // Red Border Check
+                    result.innerHTML = `
+                        <h2 style='color:#f44336; margin-top:0;'>❌ INVALID ID</h2>
+                        <p style='color:#ff5555; font-weight:bold; font-size:1.1rem; margin:10px 0;'>Plz enter valid ID card</p>
+                        <button class='btn-retry' onclick='retryProcess()'>Retry</button>
+                    `;
+                    status.innerText = "Registration Failed";
+                    // NO TIMEOUT HERE. IT STAYS FOREVER.
+                } 
+                // --- ✅ SUCCESS ---
+                else if (data.status === "success") {
+                    result.style.border = "2px solid #4caf50";
+                    result.innerHTML = `<h2 style='color:#4caf50'>✅ VERIFIED</h2><p>Distance: ${data.distance.toFixed(4)}</p>`;
+                    status.innerText = "Verified!";
+                } 
+                // --- ⚠️ PENDING ---
+                else if (data.status === "pending") {
+                    result.style.border = "2px solid #ff9800";
+                    result.innerHTML = `<h2 style='color:#ff9800'>⚠️ PENDING</h2><p>Sent to Admin</p><p>Distance: ${data.distance.toFixed(4)}</p>`;
+                } 
+                // --- ❌ REJECTED (Mismatch) ---
+                else {
+                    result.style.border = "2px solid #f44336";
+                    result.innerHTML = `
+                        <h2 style='color:#f44336'>❌ FAILED</h2>
+                        <p>${data.message}</p>
+                        <button class='btn-retry' onclick='retryProcess()'>Retry</button>
+                    `;
+                }
+
+            } catch (err) {
+                alert("Error: " + err.message);
+                retryProcess();
+            }
+        });
+    }
+</script>
+</body>
+</html>

@@ -4,6 +4,6 @@ numpy
 deepface
 pytesseract
 python-multipart
-opencv-python-headless
 tf-keras
 pillow
+opencv-python-headless

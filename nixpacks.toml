@@ -1,0 +1,10 @@
+[phases.setup]
+# We added 'libgl1' and 'xorg.libxcb' to fix your specific error
+nixPkgs = ["python311", "tesseract", "ffmpeg", "libsm", "libice", "libxext", "libxrender", "libgl1", "xorg.libxcb"]
+
+[phases.install]
+cmds = ["python -m pip install -r requirements.txt"]
+
+[start]
+# MAKE SURE 'main1:app' MATCHES YOUR FILENAME
+cmd = "uvicorn main1:app --host 0.0.0.0 --port $PORT"

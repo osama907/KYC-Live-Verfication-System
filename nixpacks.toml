@@ -1,15 +1,16 @@
 [phases.setup]
-# We use Python 3.11 from Nix, but system libraries from APT (safer)
+# We use Python 3.11
 nixPkgs = ["python311"]
-aptPkgs = ["ffmpeg", "libsm6", "libxext6", "libgl1-mesa-glx", "libglib2.0-0", "libxrender1"]
+
+# CHANGE: We replaced 'libgl1-mesa-glx' with just 'libgl1'
+aptPkgs = ["ffmpeg", "libsm6", "libxext6", "libgl1", "libglib2.0-0", "libxrender1"]
 
 [phases.install]
-# Install dependencies and remove the bad OpenCV version
+# Install dependencies and force uninstall the bad OpenCV version
 cmds = [
     "python -m pip install -r requirements.txt",
     "python -m pip uninstall -y opencv-python"
 ]
 
 [start]
-# Launch the app
 cmd = "uvicorn main1:app --host 0.0.0.0 --port $PORT"

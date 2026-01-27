@@ -1,10 +1,14 @@
 [phases.setup]
-# This installs the missing Linux libraries for OpenCV
-nixPkgs = ["python313", "ffmpeg", "libsm", "libice", "libxext", "libxrender", "libglvnd", "xorg.libxcb", "xorg.libX11"]
+# We install all possible system libraries to be safe
+nixPkgs = ["python311", "ffmpeg", "glib", "libGL", "libXext", "libXrender", "libICE", "libSM", "xorg.libxcb", "xorg.libX11"]
 
 [phases.install]
-cmds = ["python -m pip install -r requirements.txt"]
+# 1. Install dependencies
+# 2. FORCE UNINSTALL the standard opencv-python that DeepFace installs
+cmds = [
+    "python -m pip install -r requirements.txt",
+    "python -m pip uninstall -y opencv-python"
+]
 
 [start]
-# Make sure main1:app matches your filename
 cmd = "uvicorn main1:app --host 0.0.0.0 --port $PORT"

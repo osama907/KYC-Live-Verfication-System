@@ -6,6 +6,7 @@ import re
 import pytesseract
 import numpy as np
 import uvicorn
+from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,181 +29,194 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 DB_NAME = "database.db"
 
-# --- SMART THRESHOLD LOGIC ---
-VERIFIED_THRESHOLD = 0.55  # Auto-pass if below this
-DOUBT_THRESHOLD = 0.75     # Send to Admin if between 0.55 and 0.75. Reject if above.
-
+# --- SMART THRESHOLD ---
+AUTO_PASS_THRESHOLD = 0.42      
+ADMIN_REVIEW_THRESHOLD = 0.60   
 MODELS = ["ArcFace", "Facenet512"]
 
-# ---------------- DB INIT ----------------
+# ---------------- DB INIT & MIGRATION ----------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    # Create table with all required columns
     c.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cnic_path TEXT,
-            live_path TEXT,
+            selfie_path TEXT,
             status TEXT,
             distance REAL,
-            doc_type TEXT
+            doc_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # Check for missing columns (Migration Helper)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute("PRAGMA table_info(requests)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    if 'created_at' not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    if 'selfie_path' not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN selfie_path TEXT")
+        
     conn.commit()
     conn.close()
 
 init_db()
 
-def fix_database():
+# ---------------- HELPERS ----------------
+def extract_expiry_date(text):
+    date_patterns = [r"(\d{2}[./-]\d{2}[./-]\d{4})", r"(\d{4}[./-]\d{2}[./-]\d{2})"]
+    found_dates = []
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text)
+        for m in matches:
+            clean = re.sub(r"[/-]", ".", m)
+            found_dates.append(clean)
+    return found_dates[-1] if found_dates else None
+
+def extract_text_robust(image_path):
+    img = cv2.imread(image_path)
+    if img is None: return ""
+    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+    _, thresh1 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    text = pytesseract.image_to_string(thresh1, config='--oem 3 --psm 11')
+    if not extract_expiry_date(text):
+        thresh2 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        text += " " + pytesseract.image_to_string(thresh2, config='--oem 3 --psm 11')
+    return re.sub(r"\s+", " ", text).strip()
+
+def is_duplicate_document(new_doc_path):
+    """Checks if the face on the ID already exists in an APPROVED record."""
     conn = sqlite3.connect(DB_NAME)
-    try:
-        conn.execute("ALTER TABLE requests ADD COLUMN doc_type TEXT")
-        conn.commit()
-        print("✅ Database updated successfully!")
-    except sqlite3.OperationalError:
-        print("ℹ️ Column already exists.")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT cnic_path FROM requests WHERE status='APPROVED'")
+    rows = c.fetchall()
     conn.close()
 
-fix_database()
-
-# ---------------- IMAGE ENHANCEMENT ----------------
-def enhance_image(image_path):
-    img = cv2.imread(image_path)
-    if img is None: return None
-    denoised = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
-    gaussian_blur = cv2.GaussianBlur(denoised, (0, 0), 2.0)
-    enhanced = cv2.addWeighted(denoised, 1.5, gaussian_blur, -0.5, 0)
-    cv2.imwrite(image_path, enhanced)
-    return enhanced
-
-# ---------------- SMART FACE SELECTOR ----------------
-def get_primary_face(image_path, label="Image"):
-    img = cv2.imread(image_path)
-    if img is None: return None
-    try:
-        faces = DeepFace.extract_faces(
-            img_path=image_path, 
-            detector_backend="retinaface", 
-            enforce_detection=True,
-            align=True
-        )
-        main_face = max(faces, key=lambda x: x['facial_area']['w'] * x['facial_area']['h'])
-        return main_face
-    except:
-        return None
-
-# ---------------- OCR HELPER ----------------
-def extract_text(image_path):
-    img = cv2.imread(image_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    text = pytesseract.image_to_string(thresh)
-    return re.sub(r"\s+", " ", text).strip()
+    for row in rows:
+        existing_path = row['cnic_path']
+        if not os.path.exists(existing_path): continue
+        try:
+            # Using ArcFace for quick ID-to-ID comparison
+            res = DeepFace.verify(
+                img1_path=new_doc_path, 
+                img2_path=existing_path,
+                model_name="ArcFace",
+                detector_backend="retinaface",
+                enforce_detection=False
+            )
+            if res["distance"] <= 0.35: # Threshold for identical ID detection
+                return True
+        except: continue
+    return False
 
 # ---------------- VERIFY ENDPOINT ----------------
 @app.post("/verify")
-def verify_identity(cnic_image: UploadFile = File(...), live_image: UploadFile = File(...)):
+async def verify_identity(
+    cnic_image: UploadFile = File(...), 
+    selfie_image: UploadFile = File(...) 
+):
     try:
-        doc_path = os.path.join(UPLOAD_DIR, f"doc_{cnic_image.filename}")
-        live_path = os.path.join(UPLOAD_DIR, f"live_{live_image.filename}")
+        print("\n" + "🚀" * 15)
+        print("AI SYSTEM: NEW VERIFICATION REQUEST")
 
-        with open(doc_path, "wb") as f: shutil.copyfileobj(cnic_image.file, f)
-        with open(live_path, "wb") as f: shutil.copyfileobj(live_image.file, f)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        doc_path = os.path.join(UPLOAD_DIR, f"doc_{timestamp}.jpg")
+        selfie_path = os.path.join(UPLOAD_DIR, f"live_{timestamp}.jpg")
 
-        enhance_image(doc_path)
-        enhance_image(live_path)
+        for file, path in [(cnic_image, doc_path), (selfie_image, selfie_path)]:
+            with open(path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
 
-        print("\n--- 🤖 AI PROCESSING ---", flush=True)
+        # --- STEP 0: DUPLICATE CHECK ---
+        print("🔍 Checking for duplicate ID...")
+        if is_duplicate_document(doc_path):
+            print("❌ REJECTED: Duplicate Document Detected")
+            return {"status": "REJECTED", "message": "This document is already registered."}
 
-        # 1. Document Check
-        text = extract_text(doc_path)
-        face_doc = get_primary_face(doc_path, "Document")
+        # 1. OCR Stage
+        raw_text = extract_text_robust(doc_path)
+        expiry_str = extract_expiry_date(raw_text)
+        doc_type = "Passport" if "PASSPORT" in raw_text.upper() or "<<" in raw_text else "ID Card"
         
-        if not face_doc:
-            return {"status": "error", "message": "Invalid Document - No Face Detected"}
-
-        doc_type = "Passport" if "PASSPORT" in text.upper() or "<<" in text else "ID Card"
-
-        # 2. Live Face Check
-        face_live = get_primary_face(live_path, "Live Photo")
-        if not face_live:
-            return {"status": "error", "message": "Face unclear - Look at the camera"}
-
-        # 3. Verification Calculation
+        # 2. Face Verification
         distances = []
         for model in MODELS:
             res = DeepFace.verify(
-                img1_path=doc_path, 
-                img2_path=live_path, 
-                model_name=model, 
-                detector_backend="retinaface",
-                distance_metric="cosine",
-                enforce_detection=True
+                img1_path=doc_path, img2_path=selfie_path, 
+                model_name=model, detector_backend="retinaface",
+                distance_metric="cosine", align=True
             )
             distances.append(float(res["distance"]))
-
-        avg_distance = sum(distances) / len(distances)
-        print(f"📊 Avg Distance: {avg_distance:.4f}", flush=True)
-
-        # --- REFINED DECISION LOGIC ---
         
-        # CASE A: Strong Match
-        if avg_distance <= VERIFIED_THRESHOLD:
-            print("✅ Result: AUTO-PASSED", flush=True)
-            return {
-                "status": "success", 
-                "verified": True, 
-                "document": doc_type, 
-                "distance": avg_distance,
-                "message": "Identity Verified Successfully"
-            }
+        avg_distance = sum(distances) / len(distances)
 
-        # CASE B: High Doubt (Send to Admin)
-        elif VERIFIED_THRESHOLD < avg_distance <= DOUBT_THRESHOLD:
-            print("💾 Result: IN DOUBT - Sent to Admin", flush=True)
-            conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-            c.execute("INSERT INTO requests (cnic_path, live_path, status, distance, doc_type) VALUES (?, ?, ?, ?, ?)",
-                      (doc_path, live_path, "PENDING", avg_distance, doc_type))
-            conn.commit(); conn.close()
-            return {
-                "status": "pending", 
-                "verified": False, 
-                "document": doc_type, 
-                "distance": avg_distance,
-                "message": "Verification is under review by an administrator."
-            }
+        # 3. Decision Logic
+        final_status = "REJECTED"
+        icon = "❌"
+        if avg_distance <= AUTO_PASS_THRESHOLD:
+            final_status = "APPROVED"
+            icon = "✅"
+        elif avg_distance <= ADMIN_REVIEW_THRESHOLD:
+            final_status = "PENDING"
+            icon = "⚠️"
 
-        # CASE C: Complete Mismatch
-        else:
-            print("❌ Result: REJECTED (Mismatch)", flush=True)
-            return {
-                "status": "rejected", 
-                "verified": False, 
-                "document": doc_type, 
-                "distance": avg_distance,
-                "message": "Face mismatch. Identity could not be verified."
-            }
+        print(f"📊 Distance: {avg_distance:.4f}")
+        print(f"{icon} STATUS  : {final_status}")
+
+        # 4. Save to DB
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("""INSERT INTO requests (cnic_path, selfie_path, status, distance, doc_type) 
+                     VALUES (?, ?, ?, ?, ?)""",
+                  (doc_path, selfie_path, final_status, avg_distance, doc_type))
+        conn.commit()
+        last_id = c.lastrowid
+        conn.close()
+
+        print(f"🆔 DB ID    : {last_id}")
+        print("🚀" * 15 + "\n")
+
+        return {
+            "id": last_id,
+            "status": final_status,
+            "distance": avg_distance,
+            "doc_type": doc_type,
+            "expiry": expiry_str
+        }
 
     except Exception as e:
-        print(f"🔥 FATAL ERROR: {str(e)}", flush=True)
-        return {"status": "error", "message": "Processing Error"}
+        print(f"🔥 ERROR: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
-# ---------------- ADMIN ENDPOINTS ----------------
+# ---------------- ADMIN SECTION ----------------
+@app.get("/admin/all")
+def admin_all():
+    conn = sqlite3.connect(DB_NAME); conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM requests ORDER BY created_at DESC").fetchall()
+    return {"requests": [dict(row) for row in rows]}
+
 @app.get("/admin/pending")
 def admin_pending():
     conn = sqlite3.connect(DB_NAME); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM requests WHERE status='PENDING'")
-    rows = c.fetchall(); conn.close()
+    rows = conn.execute("SELECT * FROM requests WHERE status='PENDING' ORDER BY created_at DESC").fetchall()
     return {"requests": [dict(row) for row in rows]}
 
 @app.post("/admin/action")
 def admin_action(id: int = Form(...), action: str = Form(...)):
     new_status = "APPROVED" if action == "approve" else "REJECTED"
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("UPDATE requests SET status=? WHERE id=?", (new_status, id))
-    conn.commit(); conn.close()
-    return {"status": "updated", "final_decision": new_status}
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("UPDATE requests SET status=? WHERE id=?", (new_status, id))
+    conn.commit()
+    print(f"🔨 ADMIN: Request #{id} manually {new_status}")
+    return {"status": "updated"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)

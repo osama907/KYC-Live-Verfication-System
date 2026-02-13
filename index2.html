@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Identity Verification</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<style>
+    body { background:#121212; color:#fff; font-family:'Segoe UI', sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+    .app-box { width:95%; max-width:600px; text-align:center; }
+    
+    .video-container { position:relative; border-radius:20px; overflow:hidden; border:4px solid #333; background: #000; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    video { width:100%; height: auto; transform:scaleX(-1); display: block; }
+    
+    #status-overlay { position:absolute; top:20px; left:0; right:0; text-align:center; font-size:1.5rem; font-weight: bold; z-index: 10; text-shadow: 0 2px 4px #000; }
+    #guide-box { position:absolute; top:50%; left:50%; width:220px; height:280px; transform:translate(-50%,-50%); border:4px dashed rgba(255,255,255,0.5); border-radius:50%; }
+    
+    #countdown-ui { position: absolute; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 30; flex-direction: column; }
+    #timer-num { font-size: 6rem; font-weight: bold; color: #00ff00; margin: 0; }
+    
+    .btn-upload { background:#007bff; color:#fff; border:none; padding:15px 30px; font-size:1.1rem; border-radius:50px; cursor:pointer; margin-bottom:15px; font-weight: bold; transition: 0.2s; }
+    .btn-retry { background: white; color: #cc0000; border: none; padding: 10px 25px; font-size: 1rem; font-weight: bold; border-radius: 20px; margin-top: 10px; cursor: pointer; }
+
+    #result-area { margin-top:15px; background:#222; padding:20px; border-radius:15px; display:none; border: 2px solid #444; }
+</style>
+</head>
+
+<body>
+
+<div class="app-box">
+    <button class="btn-upload" id="uploadBtn" onclick="document.getElementById('cnicInput').click()">📁 Step 1: Upload ID Card</button>
+    <input type="file" id="cnicInput" accept="image/*" hidden>
+
+    <div class="video-container">
+        <video id="video" playsinline muted></video>
+        <div id="guide-box"></div>
+        <div id="status-overlay">Waiting for Upload...</div>
+        
+        <div id="countdown-ui">
+            <p style="font-size: 1.2rem; margin-bottom: 0;">STAY STILL</p>
+            <div id="timer-num">5</div>
+            <p>Capturing Live Face...</p>
+        </div>
+    </div>
+
+    <div id="result-area"></div>
+    <canvas id="canvas" hidden></canvas>
+</div>
+
+<script>
+    const API_URL = "http://127.0.0.1:8000";
+    
+    const TASKS = [
+        {type:'blink', msg:"😉 Blink Your Eyes"},
+        {type:'center',msg:"😐 Look at the Center"}
+    ];
+
+    let taskIndex = 0, isProcessing = false, blinkCounter = 0; 
+
+    const video = document.getElementById("video");
+    const status = document.getElementById("status-overlay");
+    const guide = document.getElementById("guide-box");
+    const result = document.getElementById("result-area");
+    const cnicInput = document.getElementById("cnicInput");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const countdownUI = document.getElementById("countdown-ui");
+    const timerNum = document.getElementById("timer-num");
+
+    const faceMesh = new FaceMesh({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+    faceMesh.setOptions({maxNumFaces: 1, refineLandmarks: true});
+    faceMesh.onResults(onResults);
+
+    const camera = new Camera(video, {
+        onFrame: async () => { if(!isProcessing) await faceMesh.send({image: video}); },
+        width: 640, height: 480
+    });
+
+    function onResults(r) {
+        if (isProcessing) return;
+        if (!r.multiFaceLandmarks || r.multiFaceLandmarks.length === 0) {
+            status.innerText = "❌ No Face Detected"; guide.style.borderColor = "red"; return;
+        }
+        
+        guide.style.borderColor = "#00ff00"; 
+        const lm = r.multiFaceLandmarks[0];
+        const task = TASKS[taskIndex];
+        status.innerText = task.msg;
+
+        if (checkTask(task.type, lm)) {
+            if (taskIndex < TASKS.length - 1) { 
+                taskIndex++; 
+            } else { 
+                startSelfieFlow(); 
+            }
+        }
+    }
+
+    function checkTask(t, lm) {
+        const nose = lm[1], eyeTop = lm[159], eyeBottom = lm[145];
+        if (t === 'blink') {
+            const d = Math.hypot(eyeTop.x - eyeBottom.x, eyeTop.y - eyeBottom.y);
+            if (d < 0.012) blinkCounter++;
+            return blinkCounter > 2; 
+        }
+        if (t === 'center') {
+            return nose.x > 0.4 && nose.x < 0.6;
+        }
+        return false;
+    }
+
+    async function startSelfieFlow() {
+        isProcessing = true; 
+        status.innerText = "Liveness Verified!";
+        
+        countdownUI.style.display = "flex";
+        let count = 5;
+        timerNum.innerText = count;
+        
+        const interval = setInterval(async () => {
+            count--;
+            timerNum.innerText = count;
+            if (count === 0) {
+                clearInterval(interval);
+                const selfieBlob = await getCanvasBlob();
+                countdownUI.style.display = "none";
+                captureAndSend(selfieBlob);
+            }
+        }, 1000);
+    }
+
+    function getCanvasBlob() {
+        return new Promise(resolve => {
+            const canvas = document.getElementById("canvas");
+            canvas.width = video.videoWidth; 
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext("2d");
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(video, 0, 0);
+            canvas.toBlob(blob => resolve(blob), "image/jpeg", 0.95);
+        });
+    }
+
+    async function captureAndSend(selfieBlob) {
+        status.innerText = "📸 Verifying Identity...";
+        
+        const fd = new FormData();
+        fd.append("cnic_image", cnicInput.files[0]);
+        // Updated to use selfie_image to match your backend logic
+        fd.append("selfie_image", selfieBlob, "selfie.jpg"); 
+
+        try {
+            const res = await fetch(`${API_URL}/verify`, { method: "POST", body: fd });
+            if (!res.ok) throw new Error(`Server responded with status ${res.status}`);
+            
+            const data = await res.json();
+            result.style.display = "block"; 
+
+            // --- SYNCED WITH BACKEND STATUS CODES ---
+            if (data.status === "APPROVED") {
+                result.style.borderColor = "#4caf50";
+                result.style.background = "rgba(76, 175, 80, 0.1)";
+                result.innerHTML = `
+                    <h2 style='color:#4caf50'>✅ VERIFIED</h2>
+                    <p>AI Match Score: <b>${data.distance.toFixed(4)}</b></p>
+                    <p>Your identity has been confirmed successfully.</p>
+                `;
+                status.innerText = "Verification Successful";
+            } 
+            else if (data.status === "PENDING") {
+                result.style.borderColor = "#ff9800";
+                result.style.background = "rgba(255, 152, 0, 0.1)";
+                result.innerHTML = `
+                    <h2 style='color:#ff9800'>⚠️ PENDING REVIEW</h2>
+                    <p>AI Score: ${data.distance.toFixed(4)}</p>
+                    <p>The system is unsure. Your details have been sent to our Admin for manual approval.</p>
+                `;
+                status.innerText = "Sent for Admin Review";
+            } 
+            else if (data.status === "REJECTED") {
+                result.style.borderColor = "#f44336";
+                result.style.background = "rgba(244, 67, 54, 0.1)";
+                result.innerHTML = `
+                    <h2 style='color:#f44336'>❌ REJECTED</h2>
+                    <p>Identity could not be confirmed (Score: ${data.distance.toFixed(4)}).</p>
+                    <button class='btn-retry' onclick='retryProcess()'>Try Again</button>
+                `;
+                status.innerText = "Verification Rejected";
+            }
+            else {
+                result.innerHTML = `<h2 style='color:red'>Error</h2><p>${data.message}</p>`;
+            }
+        } catch (err) {
+            alert("Connection Error: " + err.message);
+            retryProcess();
+        }
+    }
+
+    function retryProcess() {
+        isProcessing = false;
+        taskIndex = 0;
+        blinkCounter = 0;
+        result.style.display = "none";
+        status.innerText = TASKS[0].msg;
+        uploadBtn.innerText = "📁 Upload ID Card";
+        uploadBtn.disabled = false;
+    }
+
+    cnicInput.onchange = () => {
+        if (cnicInput.files.length > 0) {
+            uploadBtn.innerText = "✅ ID Uploaded";
+            uploadBtn.disabled = true;
+            camera.start();
+        }
+    };
+</script>
+</body>
+</html>

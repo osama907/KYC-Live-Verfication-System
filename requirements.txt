@@ -1,9 +1,11 @@
 fastapi
 uvicorn
+python-multipart
+motor
+dnspython
+python-dotenv
+opencv-python-headless
+pytesseract
 numpy
 deepface
-pytesseract
-python-multipart
 tf-keras
-pillow
-opencv-python-headless

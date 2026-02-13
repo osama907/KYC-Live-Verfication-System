@@ -1,16 +1,26 @@
 [phases.setup]
-# We use Python 3.11
+# Hostinger VPS supports Python 3.11/3.12
 nixPkgs = ["python311"]
 
-# CHANGE: We replaced 'libgl1-mesa-glx' with just 'libgl1'
-aptPkgs = ["ffmpeg", "libsm6", "libxext6", "libgl1", "libglib2.0-0", "libxrender1"]
+# Hostinger uses standard Debian/Ubuntu names for packages
+aptPkgs = [
+    "ffmpeg", 
+    "libsm6", 
+    "libxext6", 
+    "libgl1-mesa-glx", 
+    "libglib2.0-0", 
+    "libxrender1", 
+    "tesseract-ocr"
+]
 
 [phases.install]
-# Install dependencies and force uninstall the bad OpenCV version
+# Ensure we have the right server tools for production
 cmds = [
     "python -m pip install -r requirements.txt",
-    "python -m pip uninstall -y opencv-python"
+    "python -m pip install gunicorn uvicorn"
 ]
 
 [start]
-cmd = "uvicorn main1:app --host 0.0.0.0 --port $PORT"
+# Use Gunicorn for high traffic and better stability on a VPS
+# If your file is main1.py, keep main1:app. If it is main.py, change to main:app
+cmd = "gunicorn main1:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000"
